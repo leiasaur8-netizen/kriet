@@ -64,68 +64,93 @@ _jobs      = {}          # job_id -> job state dict
 _jobs_lock = threading.Lock()
 
 
-class _JobQueue:
-    """Drop-in queue replacement that also persists events to the DB.
-
-    This makes every event visible to any autoscale instance that needs to
-    serve the SSE stream, even if the job was started on a different instance.
-    DB writes happen in a daemon thread so they never block the worker.
-    Ping events are NOT persisted (they carry no information).
-    """
-
-    def __init__(self, job_id=''):
-        self._q      = queue.Queue()
-        self.job_id  = job_id
-
-    def put(self, item):
-        self._q.put(item)
-        if self.job_id and item.get('type') != 'ping':
-            jid = self.job_id
-            def _persist():
-                try:
-                    _sto.append_job_event(jid, item)
-                except Exception:
-                    pass
-            threading.Thread(target=_persist, daemon=True).start()
-
-    def get(self, timeout=None):
-        if timeout is not None:
-            return self._q.get(timeout=timeout)
-        return self._q.get()
-
-
 def _new_job_state():
     return {
-        'task_queue':   _JobQueue(),   # job_id wired in run_creation
-        'result_store': [],
-        'running':      True,
-        'lock':         threading.Lock(),
-        'done_count':   [0],
-        'cp_count':     [0],
+        'task_queue':        queue.Queue(),
+        'result_store':      [],
+        'running':           True,
+        'lock':              threading.Lock(),
+        'done_count':        [0],
+        'cp_count':          [0],
+        'proxy_removed_count': [0],
     }
 
 # ── Session store for retry-confirm ──────────────────────────────────────────
 _session_store = {}   # uid -> {'ses': requests.Session, 'email': str, 'password': str, 'job_id': str}
 _session_lock  = threading.Lock()
 
-WORKERS = 2000  # parallel workers per job
+WORKERS = 50  # parallel workers per job
+
+
+# ── Proxy helpers ─────────────────────────────────────────────────────────────
+
+_proxy_lock = __import__('threading').Lock()
+
+
+def _parse_proxy_list(raw):
+    """Parse a newline/comma-separated list of proxy strings into normalized URLs."""
+    proxies = []
+    for line in raw.replace(',', '\n').splitlines():
+        p = line.strip()
+        if not p:
+            continue
+        if '://' not in p:
+            p = 'http://' + p
+        proxies.append(p)
+    return proxies
+
+
+def _pick_proxy(proxy_pool):
+    """Return (url, proxy_dict) from the pool, or (None, None)."""
+    if not proxy_pool:
+        return None, None
+    url = _random.choice(proxy_pool)
+    return url, {'http': url, 'https': url}
+
+
+def _remove_dead_proxy(url):
+    """Remove a proxy URL from storage (called when a worker detects failure)."""
+    if not url:
+        return
+    with _proxy_lock:
+        stored = _sto.load('proxies', default=[])
+        if not isinstance(stored, list):
+            return
+        cleaned = [u for u in stored if u != url]
+        if len(cleaned) != len(stored):
+            _sto.save('proxies', cleaned)
+
+
+def _load_active_proxies():
+    """Load all proxy URLs from admin-configured store."""
+    stored = _sto.load('proxies', default=[])
+    if not isinstance(stored, list):
+        return []
+    result = []
+    for p in stored:
+        if isinstance(p, str):
+            result.append(p)
+        elif isinstance(p, dict) and p.get('url'):
+            result.append(p['url'])
+    return result
+
 
 # ── Auth routes ───────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
-    from flask import make_response
     key = request.cookies.get('access_key', '')
     if key:
-        ip = _get_client_ip()
-        status, entry = auth.check_key(key, ip=ip)
+        status, entry = auth.check_key(key)
         if status in ('approved', 'consumed'):
             auth.touch_key(key)
             return render_template('index.html', user_name=entry.get('name', ''))
-        # Clear stale/invalid/stolen cookie so the user sees the login page cleanly
-        r = make_response(render_template('login.html'))
-        r.delete_cookie('access_key')
-        return r
+        if status == 'expired':
+            resp = render_template('login.html')
+            from flask import make_response
+            r = make_response(resp)
+            r.delete_cookie('access_key')
+            return r
     return render_template('login.html')
 
 
@@ -219,7 +244,7 @@ def _require_auth():
         return False
     ip = _get_client_ip()
     status, _ = auth.check_key(key, ip=ip)
-    if status in ('expired', 'already_used', 'ip_mismatch', 'invalid'):
+    if status == 'expired':
         return False
     return status in ('approved', 'consumed')
 
@@ -240,6 +265,11 @@ def start():
     password_type   = data.get('password_type', 'auto')
     custom_password = data.get('custom_password', '')
     gender          = data.get('gender', '3')
+    proxy_raw       = data.get('proxies', '')
+    if proxy_raw:
+        proxy_pool = _parse_proxy_list(proxy_raw)
+    else:
+        proxy_pool = _load_active_proxies()
 
     if email_domain in dm.get_custom_domains():
         if domain_password != dm.get_domain_password():
@@ -252,7 +282,7 @@ def start():
 
     threading.Thread(
         target=run_creation,
-        args=(name_type, email_domain, count, password_type, custom_password, gender, job_id, job),
+        args=(name_type, email_domain, count, password_type, custom_password, gender, job_id, job, proxy_pool),
         daemon=True,
     ).start()
 
@@ -261,7 +291,7 @@ def start():
 
 # ── Worker ────────────────────────────────────────────────────────────────────
 
-def _create_one(name_type, gender, password_type, custom_password, num, session_id, email_domain, job):
+def _create_one(name_type, gender, password_type, custom_password, num, session_id, email_domain, job, proxy_pool=None):
     jq   = job['task_queue']
     jlk  = job['lock']
     jdc  = job['done_count']
@@ -274,22 +304,37 @@ def _create_one(name_type, gender, password_type, custom_password, num, session_
                 return
 
         try:
-            # Generate a unique device fingerprint for this account.
-            # Every request for this account (register + email confirm) uses the
-            # same profile so the session looks like one consistent physical device.
-            _dp = m.make_device_profile()
-
             ses = m.requests.Session()
             _adp = m.requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=2, max_retries=0)
             ses.mount('https://', _adp)
             ses.mount('http://',  _adp)
-            response = ses.get("https://m.facebook.com/reg/", timeout=7)
+            _proxy_url, _proxy = _pick_proxy(proxy_pool)
+            if _proxy:
+                ses.proxies.update(_proxy)
+            try:
+                response = ses.get("https://m.facebook.com/reg/", timeout=10)
+            except Exception as _conn_err:
+                if _proxy_url:
+                    _remove_dead_proxy(_proxy_url)
+                    with _proxy_lock:
+                        try:
+                            proxy_pool.remove(_proxy_url)
+                        except ValueError:
+                            pass
+                    job['proxy_removed_count'][0] += 1
+                    jq.put({'type': 'proxy_stat',
+                            'active': len(proxy_pool),
+                            'removed': job['proxy_removed_count'][0]})
+                    jq.put({'type': 'log', 'level': 'warn',
+                            'msg': f'Proxy failed & removed — {len(proxy_pool)} remaining'})
+                time.sleep(_random.uniform(0.3, 0.8))
+                continue
             form     = m.extractor(response.text)
 
             if not form.get("lsd") and not form.get("fb_dtsg"):
                 jq.put({'type': 'log', 'level': 'warn',
                         'msg': 'Could not load reg page, retrying…'})
-                time.sleep(_random.uniform(0.05, 0.15))
+                time.sleep(_random.uniform(0.3, 0.8))
                 continue
 
             if name_type == '2':
@@ -346,38 +391,30 @@ def _create_one(name_type, gender, password_type, custom_password, num, session_
                 '__dyn': '', '__csr': '', '__req': 'q', '__a': '', '__user': '0',
             }
 
-            # Mimic a human spending time filling in the form (0.3-1.5 s).
-            # Bots that submit in <200ms are trivially detected; longer delays
-            # hurt bulk throughput so keep this in the sub-2-second range.
-            time.sleep(_random.uniform(0.3, 1.5))
-
             merged_headers = {
-                'User-Agent':    _dp['ua'],
+                'User-Agent':    m.FB_LITE_UA,
                 'Accept':        ('text/html,application/xhtml+xml,application/xml;q=0.9,'
                                   'image/avif,image/webp,image/apng,*/*;q=0.8,'
                                   'application/signed-exchange;v=b3;q=0.7'),
                 'Accept-Encoding':   'gzip, deflate, br',
-                'Accept-Language':   _dp['locale'],
+                'Accept-Language':   'en-US,en;q=0.9',
                 'Cache-Control':     'max-age=0',
                 'Origin':            'https://m.facebook.com',
                 'Referer':           'https://m.facebook.com/reg/',
                 'sec-ch-prefers-color-scheme': 'light',
-                'sec-ch-ua':          _dp['sec_ch_ua'],
+                'sec-ch-ua':         '"Android WebView";v="109", "Chromium";v="109", "Not_A Brand";v="24"',
                 'sec-ch-ua-mobile':  '?1',
-                'sec-ch-ua-model':   f'"{_dp["model"]}"',
-                'sec-ch-ua-platform': '"Android"',
-                'sec-ch-ua-platform-version': f'"{_dp["android_ver"]}"',
+                'sec-ch-ua-platform':'"Android"',
                 'sec-fetch-dest':    'document',
                 'sec-fetch-mode':    'navigate',
                 'sec-fetch-site':    'same-origin',
                 'sec-fetch-user':    '?1',
                 'upgrade-insecure-requests': '1',
                 'x-requested-with':  'com.facebook.lite',
-                'x-fb-connection-type': _dp['connection_type'],
-                'viewport-width':    _dp['viewport_width'],
+                'viewport-width':    '980',
             }
 
-            ses.post(_reg_url, data=payload, headers=merged_headers, timeout=8)
+            ses.post(_reg_url, data=payload, headers=merged_headers, timeout=12)
             login_coki = ses.cookies.get_dict()
 
             if "c_user" in login_coki:
@@ -410,7 +447,6 @@ def _create_one(name_type, gender, password_type, custom_password, num, session_
                     _session_store[uid] = {
                         'ses': ses, 'email': phone, 'password': pww,
                         'tmail_token': _tmail_tok,
-                        'device_profile': _dp,
                         'job_id': job.get('job_id', ''),
                     }
 
@@ -431,16 +467,11 @@ def _create_one(name_type, gender, password_type, custom_password, num, session_
                     'https://www.facebook.com/confirmemail.php?send=1',
                 ]
                 _ih = {
-                    'User-Agent':       _dp['ua'],
+                    'User-Agent':       m.FB_LITE_UA,
                     'Accept':           'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language':  _dp['locale'],
+                    'Accept-Language':  'en-US,en;q=0.9',
                     'Accept-Encoding':  'gzip, deflate, br',
                     'Referer':          'https://m.facebook.com/confirmemail.php',
-                    'sec-ch-ua':        _dp['sec_ch_ua'],
-                    'sec-ch-ua-mobile': '?1',
-                    'sec-ch-ua-model':  f'"{_dp["model"]}"',
-                    'sec-ch-ua-platform': '"Android"',
-                    'sec-ch-ua-platform-version': f'"{_dp["android_ver"]}"',
                     'x-requested-with': 'com.facebook.lite',
                 }
                 def _ifire(u):
@@ -454,7 +485,6 @@ def _create_one(name_type, gender, password_type, custom_password, num, session_
                 threading.Thread(
                     target=m._full_email_confirm,
                     args=(ses, phone, uid, pww, jq),
-                    kwargs={'device_profile': _dp},
                     daemon=False,
                 ).start()
 
@@ -465,39 +495,34 @@ def _create_one(name_type, gender, password_type, custom_password, num, session_
                         'msg': f'⚠ Checkpoint — {firstname} {lastname} | {phone}'})
 
         except Exception as e:
-            _emsg = str(e)
-            if 'timed out' in _emsg.lower() or 'timeout' in _emsg.lower() or 'connectionpool' in _emsg.lower():
-                time.sleep(_random.uniform(0.1, 0.3))
-            else:
-                jq.put({'type': 'log', 'level': 'error', 'msg': _emsg})
-                time.sleep(_random.uniform(0.05, 0.15))
+            jq.put({'type': 'log', 'level': 'error', 'msg': str(e)})
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
-def run_creation(name_type, email_domain, count, password_type, custom_password, gender, job_id, job):
+def run_creation(name_type, email_domain, count, password_type, custom_password, gender, job_id, job, proxy_pool=None):
     import uuid
     session_id = str(uuid.uuid4())
 
     job['job_id'] = job_id
     jq = job['task_queue']
-    jq.job_id = job_id          # wire job_id into the queue so it can persist events
-    _sto.create_job(job_id)     # register job in DB for cross-instance SSE
 
     _sto.save_session(session_id, count, email_domain)
 
-    actual_workers = min(WORKERS, max(50, count * 15))
+    actual_workers = WORKERS
 
+    proxy_info = f' via {len(proxy_pool)} proxies' if proxy_pool else ''
     jq.put({'type': 'log', 'level': 'info',
-            'msg': f'Starting {count} account(s) with {actual_workers} workers on {email_domain}…'})
+            'msg': f'Starting {count} account(s) with {actual_workers} workers on {email_domain}{proxy_info}…'})
+    if proxy_pool:
+        jq.put({'type': 'proxy_stat', 'active': len(proxy_pool), 'removed': 0})
 
     try:
         with ThreadPoolExecutor(max_workers=actual_workers) as pool:
-            futures = []
-            for i in range(actual_workers):
-                futures.append(
-                    pool.submit(_create_one, name_type, gender, password_type, custom_password, count, session_id, email_domain, job)
-                )
+            futures = [
+                pool.submit(_create_one, name_type, gender, password_type, custom_password, count, session_id, email_domain, job, proxy_pool)
+                for _ in range(actual_workers)
+            ]
             for f in as_completed(futures):
                 try:
                     f.result()
@@ -515,14 +540,6 @@ def run_creation(name_type, email_domain, count, password_type, custom_password,
                            + (f', {job["cp_count"][0]} checkpointed' if job['cp_count'][0] else '') + '.'),
         }
         jq.put(job['final'])
-        # Persist final state to DB so any instance can serve a reconnecting SSE client
-        _sto.update_job_state(
-            job_id,
-            running=False,
-            done_count=job['done_count'][0],
-            cp_count=job['cp_count'][0],
-            final_data=job['final'],
-        )
         # Keep job in registry for 30 min so reconnecting SSE clients get a clean done event
         def _expire_job(jid):
             time.sleep(1800)
@@ -541,71 +558,43 @@ def stream():
     job_id = request.args.get('job_id', '')
     with _jobs_lock:
         job = _jobs.get(job_id)
-
-    if job:
-        # ── Fast path: job lives in this instance's memory ────────────────
-        jq = job['task_queue']
-
-        def generate_local():
+    if not job:
+        # Job not found — send a done event so the client stops retrying
+        def _gen_not_found():
             yield 'retry: 3000\n\n'
-            if not job.get('running') and job.get('final'):
-                yield f'data: {json.dumps(job["final"])}\n\n'
-                return
-            empty = 0
-            while empty < 38:
-                try:
-                    item = jq.get(timeout=8)
-                    empty = 0
-                    yield f'data: {json.dumps(item)}\n\n'
-                    if item.get('type') == 'done':
-                        return
-                except queue.Empty:
-                    empty += 1
-                    yield f'data: {json.dumps({"type": "ping"})}\n\n'
-                    if not job.get('running') and job.get('final'):
-                        yield f'data: {json.dumps(job["final"])}\n\n'
-                        return
-
+            yield f'data: {json.dumps({"type": "done", "msg": "Job not found or expired.", "created": 0, "total": 0, "checkpoint": 0})}\n\n'
         return Response(
-            generate_local(),
+            _gen_not_found(),
             mimetype='text/event-stream',
             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
         )
 
-    # ── Fallback path: job is on a different autoscale instance, poll DB ──
-    def generate_db():
+    jq = job['task_queue']
+
+    def generate():
         yield 'retry: 3000\n\n'
-        last_id   = 0
-        misses    = 0
-        # Check DB exists for this job_id first
-        state = _sto.get_job_state(job_id)
-        if state is None:
-            yield f'data: {json.dumps({"type": "done", "msg": "Job not found or expired.", "created": 0, "total": 0, "checkpoint": 0})}\n\n'
+        # If job already finished, send the final event immediately
+        if not job.get('running') and job.get('final'):
+            yield f'data: {json.dumps(job["final"])}\n\n'
             return
-        while misses < 40:
-            events, last_id = _sto.get_job_events_since(job_id, last_id)
-            if events:
-                misses = 0
-                for ev in events:
-                    yield f'data: {json.dumps(ev)}\n\n'
-                    if ev.get('type') == 'done':
-                        return
-            else:
-                misses += 1
-                yield f'data: {json.dumps({"type": "ping"})}\n\n'
-                # Check if job finished while we were idle
-                state = _sto.get_job_state(job_id)
-                if state and not state['running'] and state['final']:
-                    # Emit any remaining events, then the final
-                    events, last_id = _sto.get_job_events_since(job_id, last_id)
-                    for ev in events:
-                        yield f'data: {json.dumps(ev)}\n\n'
-                    yield f'data: {json.dumps(state["final"])}\n\n'
+        empty = 0
+        while empty < 38:
+            try:
+                item = jq.get(timeout=8)
+                empty = 0
+                yield f'data: {json.dumps(item)}\n\n'
+                if item.get('type') == 'done':
                     return
-            time.sleep(2)
+            except queue.Empty:
+                empty += 1
+                yield f'data: {json.dumps({"type": "ping"})}\n\n'
+                # If job finished while we were waiting, send final and exit
+                if not job.get('running') and job.get('final'):
+                    yield f'data: {json.dumps(job["final"])}\n\n'
+                    return
 
     return Response(
-        generate_db(),
+        generate(),
         mimetype='text/event-stream',
         headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
     )
@@ -652,37 +641,10 @@ def api_domains():
     if not _require_auth():
         return jsonify({'error': 'Unauthorized'}), 401
     info = dm.get_all_info()
-    resp = jsonify({
+    return jsonify({
         'temp':   info.get('temp', []),
         'custom': [e['domain'] for e in info.get('custom', [])],
     })
-    resp.headers['Cache-Control'] = 'no-store'
-    return resp
-
-
-@app.route('/api/key-info')
-def api_key_info():
-    if not _require_auth():
-        return jsonify({'error': 'Unauthorized'}), 401
-    key = request.cookies.get('access_key', '')
-    if not key:
-        return jsonify({'expires_at': None})
-    _, entry = auth.check_key(key)
-    expires_at = entry.get('expires_at') if entry else None
-    return jsonify({'expires_at': expires_at})
-
-
-@app.route('/api/user/add-domain', methods=['POST'])
-def user_add_domain():
-    if not _require_auth():
-        return jsonify({'error': 'Unauthorized'}), 401
-    domain = ((request.json or {}).get('domain') or '').strip().lower()
-    if not domain or '.' not in domain:
-        return jsonify({'error': 'Enter a valid domain (e.g. mail.example.com)'}), 400
-    ok = dm.add_temp_domain(domain)
-    if ok is None:
-        return jsonify({'error': 'Failed to save domain, please try again'}), 500
-    return jsonify({'status': 'added' if ok else 'exists'})
 
 
 @app.route('/download')
@@ -711,18 +673,16 @@ def retry_confirm():
         entry = _session_store.get(uid)
     if not entry:
         return jsonify({'error': 'Session expired — cannot retry'}), 404
-    ses            = entry['ses']
-    email          = entry['email']
-    password       = entry['password']
-    device_profile = entry.get('device_profile')
-    job_id         = entry.get('job_id', '')
+    ses      = entry['ses']
+    email    = entry['email']
+    password = entry['password']
+    job_id   = entry.get('job_id', '')
     with _jobs_lock:
         job = _jobs.get(job_id)
     jq = job['task_queue'] if job else queue.Queue()
     threading.Thread(
         target=m._full_email_confirm,
         args=(ses, email, uid, password, jq),
-        kwargs={'device_profile': device_profile},
         daemon=False,
     ).start()
     return jsonify({'status': 'retrying'})
@@ -979,6 +939,25 @@ def fetch_code_now():
                 return jsonify({'code': code})
             return jsonify({'status': 'waiting_webhook',
                             'msg': 'Waiting for email via webhook — check your mail server is forwarding correctly.'})
+        # IMAP domain
+        imap_host = cfg.get('imap_host', f'mail.{domain}')
+        imap_user = cfg.get('imap_user', f'admin@{domain}')
+        imap_pass = cfg.get('imap_pass', '')
+        try:
+            body = m._poll_imap_inbox(
+                to_addr=email,
+                imap_host=imap_host,
+                imap_user=imap_user,
+                imap_pass=imap_pass,
+                timeout_secs=28,
+            )
+            if body:
+                code = _extract_code_from_body(body)
+                if code:
+                    if _fcn_jq: _fcn_jq.put({'type': 'confirm_code', 'uid': uid, 'code': code})
+                    return jsonify({'code': code})
+        except Exception:
+            pass
         return jsonify({'status': 'not_found'})
 
     return jsonify({'status': 'unsupported_domain',
@@ -997,7 +976,7 @@ def status():
 
 # ── Admin auth ────────────────────────────────────────────────────────────────
 
-ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'chrx')
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'yuennix')
 
 def _require_admin():
     return session.get('is_admin') is True
@@ -1022,6 +1001,52 @@ def admin_login():
 def admin_logout():
     session.pop('is_admin', None)
     return jsonify({'status': 'ok'})
+
+# ── Admin proxy management ────────────────────────────────────────────────────
+
+@app.route('/admin/proxies', methods=['GET'])
+def admin_proxies_get():
+    if not _require_admin():
+        return jsonify({'error': 'Unauthorized'}), 401
+    urls = _load_active_proxies()
+    return jsonify({'proxies': urls, 'total': len(urls)})
+
+
+@app.route('/admin/proxies/add', methods=['POST'])
+def admin_proxies_add():
+    if not _require_admin():
+        return jsonify({'error': 'Unauthorized'}), 401
+    data     = request.json or {}
+    raw      = data.get('proxies', '')
+    new_urls = _parse_proxy_list(raw)
+    if not new_urls:
+        return jsonify({'error': 'No proxies provided'}), 400
+    with _proxy_lock:
+        existing = _load_active_proxies()
+        merged   = list(dict.fromkeys(existing + new_urls))
+        _sto.save('proxies', merged)
+    return jsonify({'proxies': merged, 'total': len(merged), 'added': len(new_urls)})
+
+
+@app.route('/admin/proxies/delete', methods=['POST'])
+def admin_proxies_delete():
+    if not _require_admin():
+        return jsonify({'error': 'Unauthorized'}), 401
+    url = (request.json or {}).get('url', '')
+    with _proxy_lock:
+        existing = _load_active_proxies()
+        updated  = [u for u in existing if u != url]
+        _sto.save('proxies', updated)
+    return jsonify({'status': 'ok', 'proxies': updated})
+
+
+@app.route('/admin/proxies/clear', methods=['POST'])
+def admin_proxies_clear():
+    if not _require_admin():
+        return jsonify({'error': 'Unauthorized'}), 401
+    _sto.save('proxies', [])
+    return jsonify({'status': 'ok'})
+
 
 @app.route('/admin/api/stats')
 def admin_stats():
@@ -1149,8 +1174,6 @@ def admin_add_temp():
     if not domain:
         return jsonify({'error': 'Domain is required'}), 400
     ok = dm.add_temp_domain(domain)
-    if ok is None:
-        return jsonify({'error': 'Failed to save domain, please try again'}), 500
     return jsonify({'status': 'added' if ok else 'exists'})
 
 @app.route('/admin/api/domains/add-custom', methods=['POST'])
@@ -1348,19 +1371,9 @@ def webhook_email():
             with _session_lock:
                 ses_entry = _session_store.get(uid)
             if ses_entry:
-                _dp_wh = ses_entry.get('device_profile')
-                def _follow_link(ses, link, u, jq, dp=_dp_wh):
+                def _follow_link(ses, link, u, jq):
                     try:
-                        _ih = {
-                            'User-Agent':    dp['ua']        if dp else m.FB_LITE_UA,
-                            'Accept-Language': dp['locale']  if dp else 'en-US,en;q=0.9',
-                            'sec-ch-ua':     dp['sec_ch_ua'] if dp else '"Android WebView";v="109", "Chromium";v="109", "Not_A Brand";v="24"',
-                            'sec-ch-ua-mobile': '?1',
-                            'sec-ch-ua-model': f'"{dp["model"]}"' if dp else '"2201117TY"',
-                            'sec-ch-ua-platform': '"Android"',
-                            'sec-ch-ua-platform-version': f'"{dp["android_ver"]}"' if dp else '"12"',
-                            'x-requested-with': 'com.facebook.lite',
-                        }
+                        _ih = {'User-Agent': m.FB_LITE_UA, 'Accept-Language': 'en-US,en;q=0.9'}
                         r = ses.get(link, headers=_ih, timeout=12, allow_redirects=True)
                         st = 'checkpoint' if 'checkpoint' in str(r.url) else 'confirmed'
                     except Exception:
@@ -1377,17 +1390,7 @@ def webhook_email():
     })
 
 
-@app.route('/favicon.ico')
-def favicon():
-    import os as _os
-    ico = _os.path.join(app.root_path, 'static', 'favicon.ico')
-    if _os.path.exists(ico):
-        return send_file(ico, mimetype='image/vnd.microsoft.icon')
-    return '', 204
-
-
 if __name__ == '__main__':
     auth.start_bot()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
-

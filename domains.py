@@ -66,14 +66,16 @@ def sync_weyn_email_domains():
 
 
 _DEFAULT = {
-    "domain_password": "0223",
+    "domain_password": "yuennix",
     "temp": [
         "1secmail.com", "harakirimail.com",
-        "yopmail.com", "lcxmail.site",
+        "cunt.abrdns.com", "jinbilowg.cloud-ip.cc", "yuennix.work.gd",
+        "yuennix.cc.cd",
     ],
     "custom": [
-        {"domain": "ygmail.cfd",    "imap_host": "mail.ygmail.cfd",    "imap_user": "admin@ygmail.cfd",    "imap_pass": "0223"},
-        {"domain": "lcxmail.site",  "imap_host": "mail.lcxmail.site",  "imap_user": "admin@lcxmail.site",  "imap_pass": "0223"},
+        {"domain": "weyn.store",    "imap_host": "mail.weyn.store",    "imap_user": "admin@weyn.store",    "imap_pass": "yuennix"},
+        {"domain": "jhames.shop",   "imap_host": "mail.jhames.shop",   "imap_user": "admin@jhames.shop",   "imap_pass": "yuennix"},
+        {"domain": "jakulan.site",  "imap_host": "mail.jakulan.site",  "imap_user": "admin@jakulan.site",  "imap_pass": "yuennix"},
     ]
 }
 
@@ -103,7 +105,7 @@ def _save(data):
 
 def get_domain_password():
     with _lock:
-        return _load().get('domain_password', '0223')
+        return _load().get('domain_password', 'yuennix')
 
 
 def set_domain_password(password):
